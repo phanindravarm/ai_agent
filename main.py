@@ -1,10 +1,16 @@
 import os
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
-from duckduckgo_search import DDGS
-from pypdf import PdfReader
 import psycopg2
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, END, START
+from langgraph.prebuilt import ToolNode
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.tools import tool
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import operator
+
 
 load_dotenv()
 
@@ -17,7 +23,15 @@ conn = psycopg2.connect(
 )
 cur = conn.cursor()
 
+@tool
 def calculator(a, b, operation):
+    """
+    Performs arithmetic.
+    Args:
+        a: The first number.
+        b: The second number.
+        operation: Must be 'add', 'subtract', 'multiply', or 'divide'.
+    """    
     try:
         if operation == "add":
             return a + b
@@ -33,21 +47,26 @@ def calculator(a, b, operation):
             return "Error: Unknown operation"
     except Exception as e:
         return f"Error occurred: {e}"
-    
-def search_web(query):
-    """Searches the web for current information using DuckDuckGo."""
-    try:
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=5)]
-            return results if results else "No results found."
-    except Exception as e:
-        return f"Search error: {e}"
-    
+
+@tool    
 def query_knowledge_base(query):
-    query_embedding = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=query
-    ).embeddings[0].values
+    """
+        Search the internal knowledge base for information from uploaded PDF document
+
+        Args:
+        query: A specific search string or question to look up in the document database.
+    
+    Returns:
+        A string containing the most relevant passages from the documents, 
+        including source details like document name and page numbers.
+    """
+    embeddings_model = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",
+        task_type="retrieval_query",
+        google_api_key=os.getenv("GEMINI_API_KEY")
+    )
+
+    query_embedding = embeddings_model.embed_query(query)
 
     cur.execute("""
         SELECT chunk_text, document_name, page_number, chunk_id
@@ -69,125 +88,64 @@ def query_knowledge_base(query):
 genai_api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=genai_api_key)
 
-calculator_tool = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name="calculator",
-            description="Performs basic arithmetic operations: addition, subtraction, multiplication, division.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "a": {"type": "NUMBER", "description": "The first number"},
-                    "b": {"type": "NUMBER", "description": "The second number"},
-                    "operation": {
-                        "type": "STRING", 
-                        "enum": ["add", "subtract", "multiply", "divide"],
-                        "description": "The arithmetic operation to perform"
-                    }
-                },
-                "required": ["a", "b", "operation"]
-            }
-        )
-    ]
-)
-
-search_tool = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name = "search_web",
-            description="Search the web for real-time information, news, or facts.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "query": {"type": "STRING", "description": "The search query"}
-                },
-                "required": ["query"]
-            }
-        )
-    ]
-)
-
-query_knowledge_base_tool = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name = "query_knowledge_base",
-            description="Search your internal memory for info from previously loaded PDFs.",
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "query": {"type": "STRING"}
-                },
-                "required": ["query"]
-            }
-        )
-    ]
-)
-
 system_prompt = """
-You are a document QA agent.
-
-Tool priority rules:
-
-- For questions about the uploaded report/document, ALWAYS call query_knowledge_base first.
-- Only call search_web if query_knowledge_base returns empty or irrelevant context.
-- Never call search_web repeatedly.
-- After retrieving context, answer immediately.
-
-Do not loop.
+    You are a helpful assistant with access to a document database.
+    When a user asks a question:
+    1. First, search the 'query_knowledge_base'.
+    2. CRITICALLY EVALUATE the results:
+    - If the tool returns actual explanations, use them.
+    - If the tool returns ONLY citations (like "J. Chem Phys..."), references, or says no information found, DISREGARD those results. 
+    3. If the document doesn't have a real explanation, use your OWN internal general knowledge to answer the user's question directly.
+    4. Always be honest: if you are answering from your own knowledge because the document was unhelpful, you can briefly mention that.
 """
 
-messages = [
-    types.Content(role="user", parts=[types.Part.from_text(text="What about xenon")])
-]
+tools = [calculator, query_knowledge_base]
+tool_node = ToolNode(tools)
 
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], operator.add]
 
-config = types.GenerateContentConfig(
-    system_instruction = system_prompt,
-    tools=[calculator_tool, search_tool, query_knowledge_base_tool],
-    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
-)
+client = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GEMINI_API_KEY"))
+client_with_tools = client.bind_tools(tools)
 
-
-available_functions = {
-    "calculator": calculator,
-    "search_web": search_web,
-    "query_knowledge_base": query_knowledge_base
-}
-
-max_steps = 3
-current_step = 0
-
-while current_step < max_steps:
-    response = client.models.generate_content(
-        model="gemini-3-flash-preview", 
-        contents=messages,
-        config=config,
-    )
-
-    model_turn = response.candidates[0].content
-    messages.append(model_turn)
-
-    function_calls = [part.function_call for part in model_turn.parts if part.function_call]
-
-    if function_calls:
-        current_step += 1
-        response_parts = []
-        
-        for fn_call in function_calls:
-            print(f"Model requested: {fn_call.name}({fn_call.args})")
-            function_to_call = available_functions[fn_call.name]
-            result = function_to_call(**fn_call.args)
-            
-            print(f"Result: {result}")
-
-            response_parts.append(
-                types.Part.from_function_response(
-                    name=fn_call.name,
-                    response={"result": result}
-                )
-            )
-
-        messages.append(types.Content(role="tool", parts=response_parts))
+def call_model(state: AgentState):
+    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    response = client_with_tools.invoke(messages)
+    if response.tool_calls:
+        for tool_call in response.tool_calls:
+            print(f"\n[AI DECISION]: Calling tool '{tool_call['name']}' with args: {tool_call['args']}")
     else:
-        print(f"\nFinal Response: {response.text}")
-        break
+        print("\n[AI DECISION]: Generating final text response...")
+    return {"messages": [response]}
+
+def should_continue(state: AgentState):
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return END
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", call_model)
+workflow.add_node("tool", tool_node)
+
+workflow.add_edge(START,"agent")
+workflow.add_conditional_edges(
+    "agent", 
+    should_continue,
+    {
+        "tools": "tool",  
+        END: END       
+    }
+)
+workflow.add_edge("tool", "agent")
+
+app = workflow.compile()
+
+state = app.invoke({"messages": [HumanMessage(content="Find the yield percentage or concentration of cobalt mentioned in the report, and then multiply that number by 1.5 to estimate the scaled-up requirement.")]})
+
+
+print("Result")
+final_response = state["messages"][-1]
+
+print(final_response.content)
