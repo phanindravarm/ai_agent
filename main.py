@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-from google import genai
 import psycopg2
 from typing import Annotated, TypedDict
 from langgraph.graph import StateGraph, END, START
@@ -10,7 +9,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import operator
-
+import time
 
 load_dotenv()
 
@@ -22,6 +21,9 @@ conn = psycopg2.connect(
     password=os.getenv("PG_PASSWORD") 
 )
 cur = conn.cursor()
+
+client = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GEMINI_API_KEY"))
+TOOL_TIMEOUT = 5
 
 @tool
 def calculator(a, b, operation):
@@ -51,14 +53,11 @@ def calculator(a, b, operation):
 @tool    
 def query_knowledge_base(query):
     """
-        Search the internal knowledge base for information from uploaded PDF document
-
-        Args:
-        query: A specific search string or question to look up in the document database.
-    
-    Returns:
-        A string containing the most relevant passages from the documents, 
-        including source details like document name and page numbers.
+        Multi-document retrieval:
+        1. Embed query
+        2. Retrieve top 5 documents
+        3. Retrieve top 8 chunks from those documents
+        4. Format with citations
     """
     embeddings_model = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
@@ -71,11 +70,15 @@ def query_knowledge_base(query):
     cur.execute("""
         SELECT chunk_text, document_name, page_number, chunk_id
         FROM pdf_chunks
-        ORDER BY embedding <-> %s::vector  -- The fix: add ::vector
-        LIMIT 3
+        JOIN documents USING(document_id)
+        ORDER BY embedding <-> %s::vector
+        LIMIT 10
     """, (query_embedding,))
 
     results = cur.fetchall()
+
+    if not results:
+        return "No relevant content found"
 
     formatted_results = []
     for text, doc, page, chunk_id in results:
@@ -85,8 +88,47 @@ def query_knowledge_base(query):
 
     return "\n\n---\n\n".join(formatted_results)
 
-genai_api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=genai_api_key)
+@tool
+def reranker(chunks, query):
+    """
+    Re-rank top-N chunks using LLM to find the most relevant answer.
+    """
+    prompt = f"Query: {query}\n\nChunks:\n"
+    for i, c in enumerate(chunks):
+        snippet = c["text"][:300].replace("\n", " ")
+        prompt += f"{i+1}. {snippet}...\n"
+    
+    response = client.invoke([{"role": "user", "content": prompt}])
+
+    ranked_chunk_ids = response.messages[0].content.split("\n")
+
+    ranked_chunks = []
+    for cid in ranked_chunk_ids:
+        for c in chunks:
+            if c["chunk_id"] in cid:
+                ranked_chunks.append(c)
+
+    return ranked_chunks
+
+TOOL_PERMISSIONS = {
+    "calculator": {"can_run": True},
+    "query_knowledge_base": {"can_run": True},
+    "reranker": {"can_run": True}
+}
+
+def safe_tool_call(tool_fn, **kwargs):
+    start = time.time()
+    result = tool_fn.invoke(kwargs)
+    if time.time() - start > TOOL_TIMEOUT:
+        return "Error: Tool timed out"
+    return result
+
+def safe_execute_tool(tool_name, *args, **kwargs):
+    perms = TOOL_PERMISSIONS.get(tool_name, {})
+    if not perms.get("can_run", True):
+        return f"Permission denied for {tool_name}"
+    return safe_tool_call(tools_dict[tool_name], *args, **kwargs)
+
 
 system_prompt = """
     You are a helpful assistant with access to a document database.
@@ -97,23 +139,37 @@ system_prompt = """
     - If the tool returns ONLY citations (like "J. Chem Phys..."), references, or says no information found, DISREGARD those results. 
     3. If the document doesn't have a real explanation, use your OWN internal general knowledge to answer the user's question directly.
     4. Always be honest: if you are answering from your own knowledge because the document was unhelpful, you can briefly mention that.
+    If retrieval fails or returns no meaningful content,
+    DO NOT answer from your own knowledge.
+    Instead say:
+    "I could not find the answer in the document."
+
 """
 
-tools = [calculator, query_knowledge_base]
-tool_node = ToolNode(tools)
+tools_dict = {
+    "calculator": calculator,
+    "query_knowledge_base": query_knowledge_base,
+    "reranker": reranker
+}
+
+tool_node = ToolNode(list(tools_dict.values()))
+
+client_with_tools = client.bind_tools(tools=list(tools_dict.values()))
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
-
-client = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GEMINI_API_KEY"))
-client_with_tools = client.bind_tools(tools)
+    tool_calls_count: int
 
 def call_model(state: AgentState):
     messages = [{"role": "system", "content": system_prompt}] + state["messages"]
     response = client_with_tools.invoke(messages)
     if response.tool_calls:
         for tool_call in response.tool_calls:
-            print(f"\n[AI DECISION]: Calling tool '{tool_call['name']}' with args: {tool_call['args']}")
+            tool_name = tool_call['name']
+            args = tool_call['args']
+            result = safe_execute_tool(tool_name, **args)
+            print(f"\n[AI DECISION]: Calling tool '{tool_name}' with args: {args}")
+            print(f"[TOOL RESULT]: {result}")
     else:
         print("\n[AI DECISION]: Generating final text response...")
     return {"messages": [response]}
@@ -142,10 +198,17 @@ workflow.add_edge("tool", "agent")
 
 app = workflow.compile()
 
-state = app.invoke({"messages": [HumanMessage(content="Find the yield percentage or concentration of cobalt mentioned in the report, and then multiply that number by 1.5 to estimate the scaled-up requirement.")]})
+state = {"messages" : [], "tool_calls_count" : 0}
 
+while True:
+    user_input = input("User : ")
+    
+    if user_input.lower() == "exit":
+        break
 
-print("Result")
-final_response = state["messages"][-1]
+    state = app.invoke({
+        "messages": state["messages"] + [HumanMessage(content=user_input)],
+        "tool_calls_count": state["tool_calls_count"]
+    })
 
-print(final_response.content)
+    print("Assistant : ", state["messages"][-1].content)
