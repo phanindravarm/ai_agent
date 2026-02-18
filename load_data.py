@@ -4,6 +4,7 @@ from google import genai
 from pypdf import PdfReader
 import psycopg2
 import uuid
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 load_dotenv()
@@ -26,30 +27,30 @@ conn = psycopg2.connect(
 )
 cur = conn.cursor()
 
-def process_pdf(file_path, chunk_size=400, overlap=75):
+def process_pdf(file_path):
     reader = PdfReader(file_path)
     all_chunks = []
+  
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size = 2000,
+        chunk_overlap = 300,
+        separators=["\n\n", "\n", ".", " ", ""]
+    )
 
-    for page_number, page in enumerate(reader.pages, start=1):
+    for page_number, page in enumerate(reader.pages, start = 1):
         text = page.extract_text()
+
         if not text:
             continue
 
-        words = text.split()
-        start = 0
+        chunks = splitter.split_text(text)
 
-        while start < len(words):
-            end = start + chunk_size
-            chunk_words = words[start:end]
-            chunk_text = " ".join(chunk_words)
-
+        for chunk in chunks:
             all_chunks.append({
-                "text": chunk_text,
+                "text": chunk,
                 "page": page_number
-            })
-
-            start += (chunk_size - overlap)
-
+        })
+            
     return all_chunks
 
 def load_pdf(file_path):
