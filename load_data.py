@@ -55,6 +55,14 @@ def process_pdf(file_path):
 
 def load_pdf(file_path):
     document_name = os.path.basename(file_path)
+
+    cur.execute("""
+        INSERT INTO documents (document_name) VALUES (%s)
+        RETURNING document_id
+    """, (document_name,))
+
+    document_id = cur.fetchone()[0]
+
     chunks = process_pdf(file_path)
 
     for i, chunk in enumerate(chunks):
@@ -68,11 +76,11 @@ def load_pdf(file_path):
 
         cur.execute("""
             INSERT INTO pdf_chunks
-            (chunk_id, document_name, page_number, chunk_text, embedding)
+            (chunk_id, document_id, page_number, chunk_text, embedding)
             VALUES (%s, %s, %s, %s, %s)
         """, (
             chunk_id,
-            document_name,
+            document_id,
             chunk["page"],
             chunk["text"],
             vector
@@ -82,4 +90,4 @@ def load_pdf(file_path):
 
     return f"Ingested {len(chunks)} chunks from {document_name}"
 
-print(load_pdf("/Users/phanindravarma/Downloads/cobalt-hydrogen-bonded-organic-framework-as-a-visible-light-driven-photocatalyst-for-co2-cycloaddition-reaction.pdf"))
+print(load_pdf("/Users/phanindravarma/Downloads/TIMETABLE CHANGES 2 II SEM 2025 -26.pdf"))
